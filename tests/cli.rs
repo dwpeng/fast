@@ -23,7 +23,7 @@ fn processes_multiple_files_in_input_order() {
 
     let out = Command::new(bin())
         .current_dir(&dir)
-        .args(["-T", "a.fa", "b.fa", "c.fq"])
+        .args(["stats", "-T", "a.fa", "b.fa", "c.fq"])
         .output()
         .unwrap();
 
@@ -58,7 +58,7 @@ fn continues_after_a_missing_file() {
 
     let out = Command::new(bin())
         .current_dir(&dir)
-        .args(["-T", "missing.fa", "ok.fa"])
+        .args(["stats", "-T", "missing.fa", "ok.fa"])
         .output()
         .unwrap();
 
@@ -86,7 +86,7 @@ fn basename_applies_to_all_files() {
 
     let out = Command::new(bin())
         .current_dir(&dir)
-        .args(["-b", "-T", "sub/x.fa", "y.fa"])
+        .args(["stats", "-b", "-T", "sub/x.fa", "y.fa"])
         .output()
         .unwrap();
 
@@ -112,7 +112,7 @@ fn tabular_output_is_aligned() {
 
     let out = Command::new(bin())
         .current_dir(&dir)
-        .args(["-T", "a.fa", "a-much-longer-file-name.fa"])
+        .args(["stats", "-T", "a.fa", "a-much-longer-file-name.fa"])
         .output()
         .unwrap();
 
@@ -131,4 +131,177 @@ fn tabular_output_is_aligned() {
     for line in &lines[1..] {
         assert_eq!(column_offsets(line), header_offsets);
     }
+}
+
+#[test]
+fn a_subcommand_is_required() {
+    let dir = tempdir("subcommand-required");
+    fs::write(dir.join("a.fa"), ">a\nACGT\n").unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .arg("a.fa")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("subcommand") || stderr.contains("Usage"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fa2fq_and_fq2fa_convert_records() {
+    let dir = tempdir("convert");
+    fs::write(dir.join("a.fa"), ">a desc\nACGT\nNN\n>b\nacgt\n").unwrap();
+    fs::write(dir.join("a.fq"), "@r desc\nACGT\n+\nIIII\n").unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["fa2fq", "a.fa"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "@a desc\nACGTNN\n+\nIIIIII\n@b\nacgt\n+\nIIII\n"
+    );
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["fq2fa", "a.fq"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), ">r desc\nACGT\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fa2fq_handles_an_empty_sequence_before_another_record() {
+    let dir = tempdir("fa2fq-empty");
+    fs::write(dir.join("a.fa"), ">empty\n>full\nACGT\n>last\nTT\n").unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["fa2fq", "a.fa"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "@empty\n\n+\n\n@full\nACGT\n+\nIIII\n@last\nTT\n+\nII\n"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_takes_the_first_n_records() {
+    let dir = tempdir("head");
+    fs::write(dir.join("a.fa"), ">a\nACGT\n>b\nACGTAC\n>c\nAA\n").unwrap();
+    fs::write(
+        dir.join("a.fq"),
+        "@a\nACGT\n+\nIIII\n@b\nACGTAC\n+\nIIIIII\n@c\nAA\n+\nII\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["head", "-n", "2", "a.fa"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        ">a\nACGT\n>b\nACGTAC\n"
+    );
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["head", "-n", "2", "a.fq"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "@a\nACGT\n+\nIIII\n@b\nACGTAC\n+\nIIIIII\n"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_applies_n_across_all_inputs() {
+    let dir = tempdir("head-multiple");
+    fs::write(dir.join("a.fa"), ">a1\nA\n>a2\nC\n").unwrap();
+    fs::write(dir.join("b.fa"), ">b1\nG\n>b2\nT\n").unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["head", "-n", "3", "a.fa", "b.fa"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        ">a1\nA\n>a2\nC\n>b1\nG\n"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merge_concatenates_in_order_and_rejects_mixed_formats() {
+    let dir = tempdir("merge");
+    fs::write(dir.join("a.fa"), ">a\nACGT\n").unwrap();
+    fs::write(dir.join("b.fa"), ">b\nTTTT\n").unwrap();
+    fs::write(dir.join("c.fq"), "@c\nACGT\n+\nIIII\n").unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["merge", "a.fa", "b.fa"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        ">a\nACGT\n>b\nTTTT\n"
+    );
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["merge", "a.fa", "c.fq"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("mixed FASTA and FASTQ"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn global_options_work_on_either_side_of_the_subcommand() {
+    let dir = tempdir("global-options");
+    fs::write(dir.join("a.fa"), ">a\nACGT\n>b\nTTTT\n").unwrap();
+
+    for args in [
+        vec!["-t", "2", "head", "-n", "1", "a.fa"],
+        vec!["head", "-n", "1", "-t", "2", "a.fa"],
+    ] {
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), ">a\nACGT\n");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
 }

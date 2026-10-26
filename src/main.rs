@@ -1,24 +1,68 @@
+mod convert;
+mod head;
+mod merge;
 mod parser;
 mod stats;
+mod util;
 
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use unicode_width::UnicodeWidthStr;
 
-use crate::parser::{Config, process_path};
+use crate::parser::{Config, StreamConfig, process_path};
 use crate::stats::{StatOptions, Summary};
+use crate::util::is_broken_pipe;
 
-/// Fast FASTA/FASTQ summary statistics.
+/// Fast FASTA/FASTQ toolkit.
 ///
-/// Output columns follow `seqkit stats`; N50 is included by default and the
-/// full seqkit column set is available with `-a`.
+/// `fast stats` prints summary statistics (compatible with `seqkit stats`);
+/// `fast head`, `fast fa2fq`, `fast fq2fa` and `fast merge` provide fast
+/// record-level operations.
 #[derive(Parser, Debug)]
-#[command(name = "fast", version, about, long_about = None)]
+#[command(name = "fast", version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    #[command(flatten)]
+    global: GlobalOpts,
+}
+
+/// Options shared by every subcommand.
+#[derive(Args, Debug, Clone)]
+struct GlobalOpts {
+    /// Number of threads (default: all logical CPUs)
+    #[arg(short = 't', long, value_name = "N", global = true)]
+    threads: Option<usize>,
+
+    /// Streaming read block size (e.g. 8M, 16M, 32M, 64M; minimum 1M)
+    #[arg(
+        short = 'B',
+        long = "block-size",
+        value_name = "SIZE",
+        default_value = "16M",
+        value_parser = parse_size,
+        global = true
+    )]
+    block_size: usize,
+
+    /// Plain-file read concurrency per block (0 = sequential; default: auto)
+    #[arg(long = "read-threads", value_name = "N", global = true)]
+    read_threads: Option<usize>,
+
+    /// Print read throughput progress to stderr every 5 seconds
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+}
+
+#[derive(Args, Debug)]
+struct StatsArgs {
     /// Input FASTA/FASTQ files (plain or gzip; "-" for stdin)
     #[arg(value_name = "FILE")]
     files: Vec<String>,
@@ -31,31 +75,9 @@ struct Cli {
     #[arg(short = 'T', long)]
     tabular: bool,
 
-    /// Plain-file read concurrency per block (0 = sequential; default: auto)
-    #[arg(long = "read-threads", value_name = "N")]
-    read_threads: Option<usize>,
-
-    /// Print read throughput progress to stderr every 5 seconds
-    #[arg(short = 'v', long)]
-    verbose: bool,
-
     /// Only print the basename of each file
     #[arg(short = 'b', long)]
     basename: bool,
-
-    /// Number of threads (default: all logical CPUs)
-    #[arg(short = 't', long, value_name = "N")]
-    threads: Option<usize>,
-
-    /// Streaming read block size (e.g. 8M, 16M, 32M, 64M; minimum 1M)
-    #[arg(
-        short = 'B',
-        long = "block-size",
-        value_name = "SIZE",
-        default_value = "16M",
-        value_parser = parse_size
-    )]
-    block_size: usize,
 
     /// Additional Nx statistics, e.g. -N 10,75,90
     #[arg(short = 'N', long = "N", value_name = "LIST", value_delimiter = ',')]
@@ -75,10 +97,88 @@ struct Cli {
     gap_letters: String,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Print summary statistics
+    Stats(StatsArgs),
+
+    /// Convert FASTA to FASTQ
+    #[command(name = "fa2fq")]
+    Fa2fq(Fa2fqArgs),
+
+    /// Convert FASTQ to FASTA
+    #[command(name = "fq2fa")]
+    Fq2fa(Fq2faArgs),
+
+    /// Merge (concatenate) FASTA/FASTQ files in input order
+    Merge(MergeArgs),
+
+    /// Print the first N records in total
+    Head(HeadArgs),
+}
+
+#[derive(Args, Debug)]
+struct Fa2fqArgs {
+    /// Quality character for generated FASTQ (default 'I' = Phred 40)
+    #[arg(short = 'q', long = "qual", value_name = "CHAR", default_value = "I")]
+    qual: String,
+
+    /// Output file (default: stdout; "-" for stdout)
+    #[arg(short = 'o', long = "out-file", value_name = "FILE")]
+    out_file: Option<String>,
+
+    /// Input FASTA files (plain or gzip; "-" for stdin)
+    #[arg(value_name = "FILE")]
+    files: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct Fq2faArgs {
+    /// Output file (default: stdout; "-" for stdout)
+    #[arg(short = 'o', long = "out-file", value_name = "FILE")]
+    out_file: Option<String>,
+
+    /// Input FASTQ files (plain or gzip; "-" for stdin)
+    #[arg(value_name = "FILE")]
+    files: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct MergeArgs {
+    /// Output file (default: stdout; "-" for stdout)
+    #[arg(short = 'o', long = "out-file", value_name = "FILE")]
+    out_file: Option<String>,
+
+    /// Input FASTA/FASTQ files (plain or gzip; "-" for stdin)
+    #[arg(value_name = "FILE")]
+    files: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct HeadArgs {
+    /// Number of records to print in total
+    #[arg(
+        short = 'n',
+        long = "num",
+        alias = "number",
+        value_name = "N",
+        default_value_t = 10
+    )]
+    num: u64,
+
+    /// Output file (default: stdout; "-" for stdout)
+    #[arg(short = 'o', long = "out-file", value_name = "FILE")]
+    out_file: Option<String>,
+
+    /// Input FASTA/FASTQ files (plain or gzip; "-" for stdin)
+    #[arg(value_name = "FILE")]
+    files: Vec<String>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Some(n) = cli.threads {
+    if let Some(n) = cli.global.threads {
         if n == 0 {
             eprintln!("fast: --threads must be at least 1");
             return ExitCode::FAILURE;
@@ -89,43 +189,57 @@ fn main() -> ExitCode {
         }
     }
 
-    if cli.phred_offset != 33 && cli.phred_offset != 64 {
-        eprintln!("fast: --phred-offset must be 33 or 64");
+    let stream = StreamConfig::new(
+        cli.global.block_size,
+        cli.global.read_threads,
+        cli.global.verbose,
+    );
+
+    match cli.command {
+        Command::Stats(stats) => run_stats(stats, &stream),
+        Command::Fa2fq(args) => run_fa2fq(args, &stream),
+        Command::Fq2fa(args) => run_fq2fa(args, &stream),
+        Command::Merge(args) => run_merge(args, &stream),
+        Command::Head(args) => run_head(args, &stream),
+    }
+}
+
+fn run_stats(args: StatsArgs, stream: &StreamConfig) -> ExitCode {
+    if args.phred_offset != 33 && args.phred_offset != 64 {
+        eprintln!("fast stats: --phred-offset must be 33 or 64");
         return ExitCode::FAILURE;
     }
 
-    if cli
+    if args
         .nx
         .iter()
         .any(|x| !x.is_finite() || !(0.0..=100.0).contains(x))
     {
-        eprintln!("fast: -N values must be in the range [0, 100]");
+        eprintln!("fast stats: -N values must be in the range [0, 100]");
         return ExitCode::FAILURE;
     }
 
-    if !cli.gap_letters.is_ascii() {
-        eprintln!("fast: --gap-letters must be ASCII");
+    if !args.gap_letters.is_ascii() {
+        eprintln!("fast stats: --gap-letters must be ASCII");
         return ExitCode::FAILURE;
     }
 
     let cfg = Config {
-        stats: StatOptions::new(cli.all, cli.phred_offset, cli.gap_letters.as_bytes()),
-        nx: cli.nx.clone(),
-        block_size: cli.block_size,
-        read_threads: cli.read_threads,
-        verbose: cli.verbose,
+        stats: StatOptions::new(args.all, args.phred_offset, args.gap_letters.as_bytes()),
+        nx: args.nx.clone(),
+        stream: stream.clone(),
     };
 
-    let files: Vec<String> = if cli.files.is_empty() {
+    let files: Vec<String> = if args.files.is_empty() {
         vec!["-".to_string()]
     } else {
-        cli.files.clone()
+        args.files.clone()
     };
 
     // Bound the number of files processed at once so that file-level
     // parallelism cannot blow up memory (each file keeps up to two blocks).
     let budget = 256usize << 20;
-    let per_file = cli.block_size.saturating_mul(2).max(1);
+    let per_file = stream.block_size.saturating_mul(2).max(1);
     let max_concurrent = (budget / per_file)
         .clamp(1, 32)
         .min(rayon::current_num_threads().max(1));
@@ -135,7 +249,7 @@ fn main() -> ExitCode {
         let batch_results: Vec<(String, anyhow::Result<Summary>)> = batch
             .par_iter()
             .map(|path| {
-                let name = display_name(path, cli.basename);
+                let name = display_name(path, args.basename);
                 (name, process_path(path, &cfg))
             })
             .collect();
@@ -147,21 +261,182 @@ fn main() -> ExitCode {
 
     for (path, result) in &results {
         match result {
-            Ok(summary) => rows.push(build_row(path, summary, &cli)),
+            Ok(summary) => rows.push(build_row(path, summary, &args)),
             Err(e) => {
                 failed = true;
-                eprintln!("fast: {path}: {e:#}");
+                eprintln!("fast stats: {path}: {e:#}");
             }
         }
     }
 
-    print_table(&cli, &rows);
+    print_table(&args, &rows);
 
     if failed {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn run_fa2fq(args: Fa2fqArgs, stream: &StreamConfig) -> ExitCode {
+    let qual = match parse_qual(&args.qual) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("fast fa2fq: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let files = input_files(&args.files);
+    let mut out = match open_output(args.out_file.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("fast fa2fq: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut failed = false;
+    for path in &files {
+        match convert::fa2fq(path, qual, stream, &mut *out) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return finish_output(out, false),
+            Err(e) => {
+                failed = true;
+                eprintln!("fast fa2fq: {path}: {e:#}");
+            }
+        }
+    }
+
+    finish_output(out, failed)
+}
+
+fn run_fq2fa(args: Fq2faArgs, stream: &StreamConfig) -> ExitCode {
+    let files = input_files(&args.files);
+    let mut out = match open_output(args.out_file.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("fast fq2fa: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut failed = false;
+    for path in &files {
+        match convert::fq2fa(path, stream, &mut *out) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return finish_output(out, false),
+            Err(e) => {
+                failed = true;
+                eprintln!("fast fq2fa: {path}: {e:#}");
+            }
+        }
+    }
+
+    finish_output(out, failed)
+}
+
+fn run_merge(args: MergeArgs, stream: &StreamConfig) -> ExitCode {
+    let files = input_files(&args.files);
+    let mut out = match open_output(args.out_file.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("fast merge: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match merge::run(&files, stream, &mut *out) {
+        Ok(failed) => finish_output(out, failed),
+        Err(e) if is_broken_pipe(&e) => finish_output(out, false),
+        Err(e) => {
+            eprintln!("fast merge: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_head(args: HeadArgs, stream: &StreamConfig) -> ExitCode {
+    let files = input_files(&args.files);
+    // For a small -n, do not read a full 16 MiB block before stopping.
+    let head_stream = stream.with_block_size(head_block_size(stream.block_size, args.num));
+
+    let mut out = match open_output(args.out_file.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("fast head: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match head::run(&files, args.num, &head_stream, &mut *out) {
+        Ok(failed) => finish_output(out, failed),
+        Err(e) if is_broken_pipe(&e) => finish_output(out, false),
+        Err(e) => {
+            eprintln!("fast head: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn head_block_size(configured: usize, num: u64) -> usize {
+    // A rough upper bound of 1 KiB per record keeps small `-n` values from
+    // reading a full block.  The 1 MiB floor avoids tiny reads when a single
+    // record does not fit and the reader has to grow its buffer.  Long records
+    // simply span more blocks.
+    let estimate = num.saturating_mul(1024).max(1 << 20);
+    let estimate = usize::try_from(estimate).unwrap_or(usize::MAX);
+    configured.min(estimate)
+}
+
+fn input_files(files: &[String]) -> Vec<String> {
+    if files.is_empty() {
+        vec!["-".to_string()]
+    } else {
+        files.to_vec()
+    }
+}
+
+fn open_output(path: Option<&str>) -> anyhow::Result<Box<dyn Write>> {
+    match path {
+        Some(path) if path != "-" => {
+            let file =
+                File::create(path).map_err(|e| anyhow::anyhow!("failed to create {path}: {e}"))?;
+            Ok(Box::new(BufWriter::with_capacity(1 << 20, file)))
+        }
+        _ => Ok(Box::new(BufWriter::with_capacity(1 << 20, io::stdout()))),
+    }
+}
+
+fn finish_output(mut out: Box<dyn Write>, failed: bool) -> ExitCode {
+    match out.flush() {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("fast: failed to write output: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn parse_qual(s: &str) -> Result<u8, String> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 1 {
+        return Err("--qual must be a single ASCII character".to_string());
+    }
+
+    let b = bytes[0];
+    if !(33..=126).contains(&b) {
+        return Err("--qual must be a printable ASCII character (33..=126)".to_string());
+    }
+
+    Ok(b)
 }
 
 /// Parse a human-readable byte size, e.g. `32M`, `8MiB`, `65536`.
@@ -218,7 +493,7 @@ fn display_name(path: &str, basename: bool) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn build_row(file: &str, s: &Summary, cli: &Cli) -> Vec<String> {
+fn build_row(file: &str, s: &Summary, cli: &StatsArgs) -> Vec<String> {
     let mut row = Vec::with_capacity(if cli.all {
         19 + cli.nx.len()
     } else {
@@ -371,7 +646,7 @@ fn nx_header(x: f64) -> String {
     }
 }
 
-fn headers(cli: &Cli) -> Vec<String> {
+fn headers(cli: &StatsArgs) -> Vec<String> {
     let mut headers: Vec<String> = if cli.all {
         [
             "file", "format", "type", "num_seqs", "sum_len", "min_len", "avg_len", "max_len", "Q1",
@@ -397,7 +672,7 @@ fn headers(cli: &Cli) -> Vec<String> {
     headers
 }
 
-fn print_table(cli: &Cli, rows: &[Vec<String>]) {
+fn print_table(cli: &StatsArgs, rows: &[Vec<String>]) {
     let headers = headers(cli);
 
     let left_aligned = [true, true, true];

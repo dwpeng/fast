@@ -50,17 +50,45 @@ impl Format {
     }
 }
 
-/// Configuration for one run.
-pub struct Config {
-    pub stats: StatOptions,
-    pub nx: Vec<f64>,
+/// Streaming input configuration shared by all subcommands.
+#[derive(Clone, Debug)]
+pub struct StreamConfig {
     /// Number of bytes read from the input per streaming iteration.
     pub block_size: usize,
+    /// Upper bound for the read size when a single record does not fit in
+    /// `block_size` and the reader grows its buffer.
+    pub max_block_size: usize,
     /// Plain-file read concurrency per block.  `None` selects automatically;
     /// `Some(0)` forces sequential reads.
     pub read_threads: Option<usize>,
     /// Print read throughput progress to stderr.
     pub verbose: bool,
+}
+
+impl StreamConfig {
+    pub fn new(block_size: usize, read_threads: Option<usize>, verbose: bool) -> Self {
+        Self {
+            block_size,
+            max_block_size: block_size,
+            read_threads,
+            verbose,
+        }
+    }
+
+    /// Use a smaller initial block size without lowering the growth cap.
+    pub fn with_block_size(&self, block_size: usize) -> Self {
+        Self {
+            block_size,
+            ..self.clone()
+        }
+    }
+}
+
+/// Configuration for the statistics command.
+pub struct Config {
+    pub stats: StatOptions,
+    pub nx: Vec<f64>,
+    pub stream: StreamConfig,
 }
 
 const DEFAULT_READ_THREADS: usize = 32;
@@ -69,61 +97,13 @@ const MAX_READ_THREADS: usize = 32;
 
 /// Process one file and produce display-ready statistics.
 pub fn process_path(path: &str, cfg: &Config) -> Result<Summary> {
-    if path == "-" {
-        return process_stdin(cfg);
-    }
+    let mut stats = ChunkStats::default();
+    let format = stream_path(path, &cfg.stream, |body, fmt, _eof| {
+        stats.merge(parse_body(body, fmt, cfg)?);
+        Ok(true)
+    })?;
 
-    let mut file = File::open(path).with_context(|| format!("failed to open {path}"))?;
-    let meta = file
-        .metadata()
-        .with_context(|| format!("failed to stat {path}"))?;
-
-    if meta.len() == 0 {
-        return Ok(Summary::empty("", &cfg.nx));
-    }
-
-    let mut magic = [0u8; 2];
-    if meta.len() >= 2 {
-        file.read_exact(&mut magic)
-            .with_context(|| format!("failed to read {path}"))?;
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("failed to seek {path}"))?;
-    }
-
-    if meta.len() >= 2 && magic == [0x1f, 0x8b] {
-        let decoder = gzip_decoder()?;
-        let reader = decoder
-            .open(path)
-            .with_context(|| format!("failed to open {path} for decompression"))?;
-        finish_summary(stream_stats(reader, cfg, path)?, cfg)
-    } else {
-        let (read_threads, prefetch) = match cfg.read_threads {
-            Some(n) => (n, n > 0),
-            None => match fs_kind(Path::new(path)) {
-                // High-latency network storage: more outstanding requests help,
-                // while fadvise is usually a no-op or counterproductive.
-                FsKind::Network => (DEFAULT_NETWORK_READ_THREADS, false),
-                // Large RAID arrays and SSDs both benefit from queue depth;
-                // adjacent pieces keep the access pattern sequential.
-                FsKind::Rotational | FsKind::NonRotational | FsKind::Unknown => {
-                    (DEFAULT_READ_THREADS, true)
-                }
-            },
-        };
-
-        let mut filler = FileFiller {
-            file: &file,
-            offset: 0,
-            len: meta.len(),
-            read_threads,
-            prefetch,
-        };
-
-        finish_summary(
-            stream_stats_with(cfg, path, move |buf| filler.fill(buf))?,
-            cfg,
-        )
-    }
+    finish_summary((stats, format), cfg)
 }
 
 fn finish_summary((stats, format): (ChunkStats, Option<Format>), cfg: &Config) -> Result<Summary> {
@@ -139,7 +119,67 @@ fn finish_summary((stats, format): (ChunkStats, Option<Format>), cfg: &Config) -
     }
 }
 
-fn process_stdin(cfg: &Config) -> Result<Summary> {
+/// Stream a FASTA/FASTQ input and hand every record-aligned block to
+/// `on_block`.  Returns the detected format (`None` for empty/comment-only
+/// input).  Returning `false` from the callback stops reading early.
+///
+/// This is the shared input path for stats, conversions, head and merge.  It
+/// uses the parallel `pread` reader for plain files and the parallel gzip
+/// decoder for compressed input.
+pub fn stream_path<G>(path: &str, cfg: &StreamConfig, on_block: G) -> Result<Option<Format>>
+where
+    G: FnMut(&[u8], Format, bool) -> Result<bool>,
+{
+    if path == "-" {
+        return stream_stdin(cfg, on_block);
+    }
+
+    let mut file = File::open(path).with_context(|| format!("failed to open {path}"))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat {path}"))?;
+
+    if meta.len() == 0 {
+        return Ok(None);
+    }
+
+    let mut magic = [0u8; 2];
+    if meta.len() >= 2 {
+        file.read_exact(&mut magic)
+            .with_context(|| format!("failed to read {path}"))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("failed to seek {path}"))?;
+    }
+
+    if meta.len() >= 2 && magic == [0x1f, 0x8b] {
+        let decoder = gzip_decoder()?;
+        let mut reader = decoder
+            .open(path)
+            .with_context(|| format!("failed to open {path} for decompression"))?;
+        stream_blocks_with(
+            cfg,
+            path,
+            move |buf| read_up_to(&mut reader, buf).context("failed to read input"),
+            on_block,
+        )
+    } else {
+        let (read_threads, prefetch) = read_strategy(path, cfg.read_threads);
+        let mut filler = FileFiller {
+            file: &file,
+            offset: 0,
+            len: meta.len(),
+            read_threads,
+            prefetch,
+        };
+
+        stream_blocks_with(cfg, path, move |buf| filler.fill(buf), on_block)
+    }
+}
+
+fn stream_stdin<G>(cfg: &StreamConfig, on_block: G) -> Result<Option<Format>>
+where
+    G: FnMut(&[u8], Format, bool) -> Result<bool>,
+{
     let stdin = io::stdin();
 
     // Peek at the gzip magic without consuming more than two bytes.  The bytes
@@ -149,20 +189,47 @@ fn process_stdin(cfg: &Config) -> Result<Summary> {
         let mut lock = stdin.lock();
         read_up_to(&mut lock, &mut prefix).context("failed to read stdin")?
     };
-    let chained = Cursor::new(prefix[..n].to_vec()).chain(stdin);
+    let mut chained = Cursor::new(prefix[..n].to_vec()).chain(stdin);
 
     if n == 2 && prefix == [0x1f, 0x8b] {
         let decoder = gzip_decoder()?;
-        let reader = decoder
+        let mut reader = decoder
             .stream_reader(chained)
             .context("failed to initialize gzip decoding for stdin")?;
-        finish_summary(stream_stats(reader, cfg, "-")?, cfg)
+        stream_blocks_with(
+            cfg,
+            "-",
+            move |buf| read_up_to(&mut reader, buf).context("failed to read input"),
+            on_block,
+        )
     } else {
-        finish_summary(stream_stats(chained, cfg, "-")?, cfg)
+        stream_blocks_with(
+            cfg,
+            "-",
+            move |buf| read_up_to(&mut chained, buf).context("failed to read input"),
+            on_block,
+        )
+    }
+}
+
+fn read_strategy(path: &str, read_threads: Option<usize>) -> (usize, bool) {
+    match read_threads {
+        Some(n) => (n, n > 0),
+        None => match fs_kind(Path::new(path)) {
+            // High-latency network storage: more outstanding requests help,
+            // while fadvise is usually a no-op or counterproductive.
+            FsKind::Network => (DEFAULT_NETWORK_READ_THREADS, false),
+            // Large RAID arrays and SSDs both benefit from queue depth;
+            // adjacent pieces keep the access pattern sequential.
+            FsKind::Rotational | FsKind::NonRotational | FsKind::Unknown => {
+                (DEFAULT_READ_THREADS, true)
+            }
+        },
     }
 }
 
 /// Read and parse blocks from a `Read` source until EOF.
+#[cfg(test)]
 fn stream_stats<R: Read + Send>(
     mut reader: R,
     cfg: &Config,
@@ -187,15 +254,38 @@ struct Block {
 /// parses the previous one, so disk/decompression latency is overlapped with
 /// CPU work.  Two buffers bound memory use to roughly `2 * block_size` (plus
 /// one incomplete record), independent of the input size.
-fn stream_stats_with<F>(
-    cfg: &Config,
-    label: &str,
-    mut fill: F,
-) -> Result<(ChunkStats, Option<Format>)>
+#[cfg(test)]
+fn stream_stats_with<F>(cfg: &Config, label: &str, fill: F) -> Result<(ChunkStats, Option<Format>)>
 where
     F: FnMut(&mut [u8]) -> Result<usize> + Send,
 {
+    let mut stats = ChunkStats::default();
+    let format = stream_blocks_with(&cfg.stream, label, fill, |body, fmt, _eof| {
+        stats.merge(parse_body(body, fmt, cfg)?);
+        Ok(true)
+    })?;
+
+    Ok((stats, format))
+}
+
+/// Read record-aligned blocks and invoke `on_block` for each one.
+///
+/// A dedicated reader thread fills the next buffer while the calling thread
+/// processes the previous one, so disk/decompression latency is overlapped with
+/// CPU work.  Two buffers bound memory use to roughly `2 * block_size` (plus
+/// one incomplete record), independent of the input size.
+fn stream_blocks_with<F, G>(
+    cfg: &StreamConfig,
+    label: &str,
+    mut fill: F,
+    mut on_block: G,
+) -> Result<Option<Format>>
+where
+    F: FnMut(&mut [u8]) -> Result<usize> + Send,
+    G: FnMut(&[u8], Format, bool) -> Result<bool>,
+{
     let block_size = cfg.block_size.max(1);
+    let max_block_size = cfg.max_block_size.max(block_size);
     let (full_tx, full_rx) = sync_channel::<Block>(2);
     let (free_tx, free_rx) = sync_channel::<Vec<u8>>(2);
 
@@ -203,14 +293,15 @@ where
         let _ = free_tx.send(vec![0u8; block_size]);
     }
 
-    thread::scope(|scope| -> Result<(ChunkStats, Option<Format>)> {
-        let reader = scope.spawn(move || reader_loop(&mut fill, block_size, full_tx, free_rx));
+    thread::scope(|scope| -> Result<Option<Format>> {
+        let reader = scope
+            .spawn(move || reader_loop(&mut fill, block_size, max_block_size, full_tx, free_rx));
 
-        let mut stats = ChunkStats::default();
         let mut format = None;
         let started = Instant::now();
         let mut last_report = started;
         let mut bytes_read = 0u64;
+        let mut stopped = false;
 
         while let Ok(block) = full_rx.recv() {
             if block.format.is_some() {
@@ -219,7 +310,11 @@ where
 
             if block.len > 0 {
                 let fmt = format.expect("a non-empty block has a detected format");
-                stats.merge(parse_body(&block.buf[..block.len], fmt, cfg)?);
+                if !on_block(&block.buf[..block.len], fmt, block.eof)? {
+                    stopped = true;
+                    bytes_read += block.len as u64;
+                    break;
+                }
             }
 
             bytes_read += block.len as u64;
@@ -235,6 +330,13 @@ where
             }
         }
 
+        if stopped {
+            // Unblock the reader: it may be waiting to hand us a block (the
+            // full channel is dropped) or to get a free buffer back.
+            drop(full_rx);
+            drop(free_tx);
+        }
+
         match reader.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
@@ -245,13 +347,14 @@ where
             report_progress(label, bytes_read, started.elapsed());
         }
 
-        Ok((stats, format))
+        Ok(format)
     })
 }
 
 fn reader_loop<F>(
     fill: &mut F,
-    block_size: usize,
+    initial_block_size: usize,
+    max_block_size: usize,
     full_tx: SyncSender<Block>,
     free_rx: Receiver<Vec<u8>>,
 ) -> Result<()>
@@ -265,22 +368,19 @@ where
         Err(_) => return Ok(()),
     };
     let mut filled = 0usize;
+    let mut block_size = initial_block_size;
 
     loop {
         // A block was handed to the parser; prepend the bytes belonging to the
         // incomplete trailing record to the next buffer.
         if !prefix.is_empty() {
-            if buf.len() < prefix.len() + block_size {
-                buf.resize(prefix.len() + block_size, 0);
-            }
+            ensure_len(&mut buf, prefix.len() + block_size);
             buf[..prefix.len()].copy_from_slice(&prefix);
             filled = prefix.len();
             prefix.clear();
         }
 
-        if buf.len() < filled + block_size {
-            buf.resize(filled + block_size, 0);
-        }
+        ensure_len(&mut buf, filled + block_size);
 
         let n = fill(&mut buf[filled..filled + block_size])?;
         let mut total = filled + n;
@@ -360,11 +460,27 @@ where
                 Err(_) => return Ok(()),
             };
             filled = 0;
+            block_size = initial_block_size;
         } else {
             // One record (or a comment block) larger than the buffer: keep the
-            // data in place and read more after it.
+            // data in place and read more after it.  Grow the read size
+            // geometrically up to the configured maximum so that
+            // chromosome-sized records do not turn into thousands of tiny
+            // reads (and, for FASTQ, thousands of full-buffer scans).
             filled = total;
+            block_size = block_size.saturating_mul(2).min(max_block_size);
         }
+    }
+}
+
+/// Grow a read buffer when a single record spans multiple fills.
+///
+/// Doubling avoids the quadratic copying that would result from growing by
+/// the block size on every iteration for a chromosome-sized record.
+fn ensure_len(buf: &mut Vec<u8>, needed: usize) {
+    if buf.len() < needed {
+        let new_len = needed.max(buf.len().saturating_mul(2)).max(1);
+        buf.resize(new_len, 0);
     }
 }
 
@@ -428,7 +544,7 @@ fn chunk_ranges(len: usize, threads: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn plan_chunks(data: &[u8], format: Format) -> Vec<(usize, usize)> {
+pub(crate) fn plan_chunks(data: &[u8], format: Format) -> Vec<(usize, usize)> {
     let threads = rayon::current_num_threads();
     let ranges = chunk_ranges(data.len(), threads);
 
@@ -933,19 +1049,7 @@ mod tests {
         Config {
             stats: StatOptions::new(all, 33, b"- ."),
             nx: vec![10.0, 50.0, 90.0],
-            block_size: 32 << 20,
-            read_threads: None,
-            verbose: false,
-        }
-    }
-
-    fn config_with_block(all: bool, block_size: usize) -> Config {
-        Config {
-            stats: StatOptions::new(all, 33, b"- ."),
-            nx: vec![10.0, 50.0, 90.0],
-            block_size,
-            read_threads: None,
-            verbose: false,
+            stream: StreamConfig::new(32 << 20, None, false),
         }
     }
 
@@ -1101,9 +1205,7 @@ mod stream_tests {
         Config {
             stats: StatOptions::new(true, 33, b"- ."),
             nx: vec![],
-            block_size,
-            read_threads: None,
-            verbose: false,
+            stream: StreamConfig::new(block_size, None, false),
         }
     }
 
