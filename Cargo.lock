@@ -226,7 +226,6 @@ dependencies = [
  "libc",
  "memchr",
  "noodles-fasta",
- "noodles-fastq",
  "rapidgzip-core",
  "rayon",
  "unicode-width",
@@ -302,16 +301,6 @@ dependencies = [
  "memchr",
  "noodles-bgzf",
  "noodles-core",
-]
-
-[[package]]
-name = "noodles-fastq"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b749d3b5ce244ad38790b0d1193f199244bada983fd5316fb1d3bcda162b3e97"
-dependencies = [
- "bstr",
- "memchr",
 ]
 
 [[package]]

@@ -7,10 +7,10 @@
 use std::io::Write;
 
 use anyhow::Result;
-use memchr::{memchr, memchr_iter};
+use memchr::memchr;
 use rayon::prelude::*;
 
-use crate::parser::{Format, StreamConfig, stream_path};
+use crate::parser::{Format, StreamConfig, fastq_record_end_at, stream_path};
 use crate::util::is_broken_pipe;
 
 struct HeadCut {
@@ -27,7 +27,7 @@ fn head_path(
     path: &str,
     remaining: &mut u64,
     cfg: &StreamConfig,
-    out: &mut dyn Write,
+    out: &mut (dyn Write + Send),
 ) -> Result<()> {
     if *remaining == 0 {
         return Ok(());
@@ -68,7 +68,7 @@ fn head_path(
 
 /// Run `head` over every input.  `num` is the total number of records to print
 /// across all inputs, matching `seqkit head`.
-pub fn run(files: &[String], num: u64, cfg: &StreamConfig, out: &mut dyn Write) -> Result<bool> {
+pub fn run(files: &[String], num: u64, cfg: &StreamConfig, out: &mut (dyn Write + Send)) -> Result<bool> {
     let mut remaining = num;
     let mut failed = false;
 
@@ -247,94 +247,48 @@ fn find_fastq_cut(data: &[u8], remaining: u64, eof: bool) -> HeadCut {
         };
     }
 
-    let target = remaining.saturating_mul(4);
-    let scan = scan_fastq(data, target);
+    // Walk complete records from the start of the block.  The block is
+    // record-aligned, and wrapped sequence/quality lines mean a fixed
+    // four-lines-per-record count is not valid.
+    let mut pos = 0usize;
+    let mut records = 0u64;
 
-    if let Some(pos) = scan.pos {
-        return HeadCut {
-            cut: (pos + 1).min(data.len()),
-            records: remaining,
-            reached: true,
-        };
-    }
-
-    // At EOF the final record may be missing its trailing newline, or the
-    // file may simply contain fewer records than requested.  Either way the
-    // whole remaining block belongs to the output and no more input is
-    // needed.
-    if eof {
-        return HeadCut {
-            cut: data.len(),
-            records: remaining,
-            reached: true,
-        };
-    }
-
-    // A non-EOF block always ends on a record boundary, so its newline count
-    // is a multiple of four.
-    HeadCut {
-        cut: data.len(),
-        records: scan.total / 4,
-        reached: false,
-    }
-}
-
-fn count_newlines(data: &[u8], start: usize, end: usize) -> u64 {
-    memchr_iter(b'\n', &data[start..end]).count() as u64
-}
-
-fn find_nth_newline(data: &[u8], start: usize, end: usize, n: u64) -> Option<usize> {
-    for (i, pos) in memchr_iter(b'\n', &data[start..end]).enumerate() {
-        if i as u64 + 1 == n {
-            return Some(start + pos);
-        }
-    }
-    None
-}
-
-fn scan_fastq(data: &[u8], target: u64) -> Scan {
-    let ranges = parallel_ranges(data.len());
-
-    if ranges.len() <= 1 || target <= 4096 || data.len() < (2 << 20) {
-        let mut count = 0u64;
-        for pos in memchr_iter(b'\n', data) {
-            count += 1;
-            if count == target {
-                return Scan {
-                    pos: Some(pos),
-                    total: count,
-                };
+    while pos < data.len() && records < remaining {
+        match fastq_record_end_at(data, pos) {
+            Some(end) if end > pos => {
+                pos = end;
+                records += 1;
             }
+            _ => break,
         }
-        return Scan {
-            pos: None,
-            total: count,
+    }
+
+    if records == remaining {
+        return HeadCut {
+            cut: pos,
+            records,
+            reached: true,
         };
     }
 
-    let counts: Vec<u64> = ranges
-        .par_iter()
-        .map(|&(start, end)| count_newlines(data, start, end))
-        .collect();
-
-    let total: u64 = counts.iter().sum();
-    if total < target {
-        return Scan { pos: None, total };
-    }
-
-    let mut before = 0u64;
-    for (i, &count) in counts.iter().enumerate() {
-        if before + count >= target {
-            let (start, end) = ranges[i];
-            let need = target - before;
-            let pos = find_nth_newline(data, start, end, need)
-                .or_else(|| find_nth_newline(data, start, data.len(), need));
-            return Scan { pos, total };
+    // The block contains fewer than `remaining` records.  At EOF the final
+    // record may be missing its trailing newline, and the whole remainder
+    // belongs to the output; otherwise every byte in the block is part of a
+    // complete record.
+    if eof {
+        let extra = u64::from(pos < data.len());
+        HeadCut {
+            cut: data.len(),
+            records: records + extra,
+            reached: true,
         }
-        before += count;
+    } else {
+        HeadCut {
+            cut: data.len(),
+            records,
+            reached: false,
+        }
     }
-
-    Scan { pos: None, total }
 }
 
 fn parallel_ranges(len: usize) -> Vec<(usize, usize)> {
@@ -371,6 +325,28 @@ mod tests {
         let mut out = Vec::new();
         for i in 0..records {
             out.extend_from_slice(format!("@r{i}\nACGT\n+\nIIII\n").as_bytes());
+        }
+        out
+    }
+
+    fn wrapped_fastq(records: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..records {
+            // The first record is four lines; the rest wrap at 60 columns.
+            let len = if i == 0 { 4 } else { 100 };
+            let seq: String = std::iter::repeat_n('A', len).collect();
+            let qual: String = std::iter::repeat_n('I', len).collect();
+
+            out.extend_from_slice(format!("@r{i}\n").as_bytes());
+            for line in seq.as_bytes().chunks(60) {
+                out.extend_from_slice(line);
+                out.push(b'\n');
+            }
+            out.extend_from_slice(b"+\n");
+            for line in qual.as_bytes().chunks(60) {
+                out.extend_from_slice(line);
+                out.push(b'\n');
+            }
         }
         out
     }
@@ -417,6 +393,24 @@ mod tests {
 
         let cut = find_fastq_cut(&data, 1, true);
         assert!(cut.reached);
+        assert_eq!(cut.cut, data.len());
+    }
+
+    #[test]
+    fn wrapped_fastq_cut_selects_prefix() {
+        let data = wrapped_fastq(10);
+        let cut = find_fastq_cut(&data, 3, false);
+        assert!(cut.reached);
+        assert_eq!(cut.records, 3);
+        assert_eq!(&data[..cut.cut], &wrapped_fastq(3)[..]);
+
+        let cut = find_fastq_cut(&data, 10, false);
+        assert!(cut.reached);
+        assert_eq!(cut.cut, data.len());
+
+        let cut = find_fastq_cut(&data, 20, false);
+        assert!(!cut.reached);
+        assert_eq!(cut.records, 10);
         assert_eq!(cut.cut, data.len());
     }
 

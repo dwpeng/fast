@@ -2,8 +2,8 @@
 //!
 //! Input is read into fixed-size blocks (16 MiB by default), parsed in
 //! parallel with rayon, and then the next block is read.  Memory use is
-//! independent of the file size: two block buffers, one incomplete record and
-//! the decoder's own small buffers are kept.
+//! independent of the file size: a bounded number of block buffers, one
+//! incomplete record and the decoder's own small buffers are kept.
 //!
 //! A dedicated reader thread fills the next buffer while the calling thread
 //! parses the previous one, so disk latency and decompression are overlapped
@@ -11,12 +11,18 @@
 //!
 //! * FASTA: everything up to the last `\n>` is complete; the final record is
 //!   carried over to the next block.
-//! * FASTQ: the last complete four-line record is found by scanning backwards
-//!   and validating the record structure; the remainder is carried over.
+//! * FASTQ: records are walked from the block start.  Four-line records use a
+//!   fixed-line fast path; wrapped (multi-line) sequence/quality records fall
+//!   back to an exact parser.  The trailing incomplete record is carried over.
 //!
-//! Inside a block, record-aligned chunking is used for parallelism.  noodles
-//! handles record decoding and reuses its record buffers.
+//! For CPU-heavy commands, two pipeline stages run concurrently: the reader
+//! thread decompresses and frames blocks, while rayon processes several
+//! record-aligned blocks in parallel.  Results are reordered before being
+//! consumed, so output order always matches the input.
+//!
+//! Inside a block, record-aligned chunking is used for parallelism.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -28,7 +34,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use memchr::{memchr, memmem};
 use noodles_fasta as fasta;
-use noodles_fastq as fastq;
 use rapidgzip_core::{Decoder, DecoderPool};
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -49,6 +54,10 @@ impl Format {
         }
     }
 }
+
+/// FASTQ records are parsed exactly: the common four-line form takes a fast
+/// path and wrapped (multi-line) sequence/quality records fall back to a
+/// general record-boundary walk.
 
 /// Streaming input configuration shared by all subcommands.
 #[derive(Clone, Debug)]
@@ -98,10 +107,15 @@ const MAX_READ_THREADS: usize = 32;
 /// Process one file and produce display-ready statistics.
 pub fn process_path(path: &str, cfg: &Config) -> Result<Summary> {
     let mut stats = ChunkStats::default();
-    let format = stream_path(path, &cfg.stream, |body, fmt, _eof| {
-        stats.merge(parse_body(body, fmt, cfg)?);
-        Ok(true)
-    })?;
+    let format = stream_path_map(
+        path,
+        &cfg.stream,
+        |body, fmt, _eof| parse_body(body, fmt, cfg),
+        |chunk| {
+            stats.merge(chunk);
+            Ok(true)
+        },
+    )?;
 
     finish_summary((stats, format), cfg)
 }
@@ -119,19 +133,18 @@ fn finish_summary((stats, format): (ChunkStats, Option<Format>), cfg: &Config) -
     }
 }
 
-/// Stream a FASTA/FASTQ input and hand every record-aligned block to
-/// `on_block`.  Returns the detected format (`None` for empty/comment-only
-/// input).  Returning `false` from the callback stops reading early.
-///
-/// This is the shared input path for stats, conversions, head and merge.  It
-/// uses the parallel `pread` reader for plain files and the parallel gzip
-/// decoder for compressed input.
-pub fn stream_path<G>(path: &str, cfg: &StreamConfig, on_block: G) -> Result<Option<Format>>
-where
-    G: FnMut(&[u8], Format, bool) -> Result<bool>,
-{
+/// A streaming input source.  `fill` returns decompressed (or plain) bytes;
+/// `compressed` selects the gzip pipeline parameters.
+struct InputSource {
+    fill: Box<dyn FnMut(&mut [u8]) -> Result<usize> + Send>,
+    compressed: bool,
+}
+
+/// Open a path or stdin and return a byte source plus its compression kind.
+/// `None` means an empty file.
+fn open_input(path: &str, cfg: &StreamConfig) -> Result<Option<InputSource>> {
     if path == "-" {
-        return stream_stdin(cfg, on_block);
+        return open_stdin();
     }
 
     let mut file = File::open(path).with_context(|| format!("failed to open {path}"))?;
@@ -156,30 +169,29 @@ where
         let mut reader = decoder
             .open(path)
             .with_context(|| format!("failed to open {path} for decompression"))?;
-        stream_blocks_with(
-            cfg,
-            path,
-            move |buf| read_up_to(&mut reader, buf).context("failed to read input"),
-            on_block,
-        )
+        Ok(Some(InputSource {
+            fill: Box::new(move |buf| {
+                read_up_to(&mut reader, buf).context("failed to read input")
+            }),
+            compressed: true,
+        }))
     } else {
         let (read_threads, prefetch) = read_strategy(path, cfg.read_threads);
         let mut filler = FileFiller {
-            file: &file,
+            file,
             offset: 0,
             len: meta.len(),
             read_threads,
             prefetch,
         };
-
-        stream_blocks_with(cfg, path, move |buf| filler.fill(buf), on_block)
+        Ok(Some(InputSource {
+            fill: Box::new(move |buf| filler.fill(buf)),
+            compressed: false,
+        }))
     }
 }
 
-fn stream_stdin<G>(cfg: &StreamConfig, on_block: G) -> Result<Option<Format>>
-where
-    G: FnMut(&[u8], Format, bool) -> Result<bool>,
-{
+fn open_stdin() -> Result<Option<InputSource>> {
     let stdin = io::stdin();
 
     // Peek at the gzip magic without consuming more than two bytes.  The bytes
@@ -196,20 +208,92 @@ where
         let mut reader = decoder
             .stream_reader(chained)
             .context("failed to initialize gzip decoding for stdin")?;
-        stream_blocks_with(
-            cfg,
-            "-",
-            move |buf| read_up_to(&mut reader, buf).context("failed to read input"),
-            on_block,
-        )
+        Ok(Some(InputSource {
+            fill: Box::new(move |buf| {
+                read_up_to(&mut reader, buf).context("failed to read input")
+            }),
+            compressed: true,
+        }))
     } else {
-        stream_blocks_with(
-            cfg,
-            "-",
-            move |buf| read_up_to(&mut chained, buf).context("failed to read input"),
-            on_block,
-        )
+        Ok(Some(InputSource {
+            fill: Box::new(move |buf| {
+                read_up_to(&mut chained, buf).context("failed to read input")
+            }),
+            compressed: false,
+        }))
     }
+}
+
+/// Gzip input uses smaller blocks than plain input.  Decoded blocks can then
+/// enter the processing stage sooner and the decoder can run further ahead
+/// without a large memory penalty.
+const GZIP_BLOCK_SIZE: usize = 4 << 20;
+
+/// Per-file memory allowance for block buffers in the parallel pipeline.
+const PIPELINE_MEMORY_BUDGET: usize = 64 << 20;
+
+fn effective_config(cfg: &StreamConfig, compressed: bool) -> StreamConfig {
+    if compressed {
+        cfg.with_block_size(cfg.block_size.min(GZIP_BLOCK_SIZE))
+    } else {
+        cfg.clone()
+    }
+}
+
+/// Number of decompressed blocks that may be processed concurrently.  Gzip
+/// decoding is the bottleneck, so a small number of block workers is enough
+/// to overlap processing with decompression; plain input gets its parallelism
+/// from record-aligned chunks inside each block.
+fn pipeline_workers(compressed: bool, block_size: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    let cap = if compressed { 4 } else { 2 };
+    let by_memory = (PIPELINE_MEMORY_BUDGET / block_size.max(1)).max(1);
+    threads.min(cap).min(by_memory)
+}
+
+/// Stream a FASTA/FASTQ input and hand every record-aligned block to
+/// `on_block`.  Returns the detected format (`None` for empty/comment-only
+/// input).  Returning `false` from the callback stops reading early.
+///
+/// Blocks are passed in input order and the callback runs on the calling
+/// thread.  This is used by commands whose per-block work is trivial or must
+/// stop early (`merge`, `head`).
+pub fn stream_path<G>(path: &str, cfg: &StreamConfig, on_block: G) -> Result<Option<Format>>
+where
+    G: FnMut(&[u8], Format, bool) -> Result<bool>,
+{
+    let Some(source) = open_input(path, cfg)? else {
+        return Ok(None);
+    };
+    let cfg = effective_config(cfg, source.compressed);
+    stream_blocks_with(&cfg, path, source.fill, on_block)
+}
+
+/// Two-stage streaming API: decompression and record framing run on the
+/// dedicated reader thread (the gzip decoder itself uses several workers),
+/// while `process` runs on up to [`pipeline_workers`] rayon tasks.  Results are
+/// handed to `consume` in input order, so output stays deterministic.
+///
+/// `process` must be side-effect free (or internally synchronized); use
+/// `consume` for writes and accumulators.  Returning `false` from `consume`
+/// stops reading early.
+pub fn stream_path_map<T, P, C>(
+    path: &str,
+    cfg: &StreamConfig,
+    process: P,
+    consume: C,
+) -> Result<Option<Format>>
+where
+    P: Fn(&[u8], Format, bool) -> Result<T> + Sync,
+    C: FnMut(T) -> Result<bool> + Send,
+    T: Send,
+{
+    let Some(source) = open_input(path, cfg)? else {
+        return Ok(None);
+    };
+    let cfg = effective_config(cfg, source.compressed);
+    let workers = pipeline_workers(source.compressed, cfg.block_size);
+    stream_blocks_map(&cfg, path, source.fill, workers, process, consume)
 }
 
 fn read_strategy(path: &str, read_threads: Option<usize>) -> (usize, bool) {
@@ -260,10 +344,17 @@ where
     F: FnMut(&mut [u8]) -> Result<usize> + Send,
 {
     let mut stats = ChunkStats::default();
-    let format = stream_blocks_with(&cfg.stream, label, fill, |body, fmt, _eof| {
-        stats.merge(parse_body(body, fmt, cfg)?);
-        Ok(true)
-    })?;
+    let format = stream_blocks_map(
+        &cfg.stream,
+        label,
+        fill,
+        2,
+        |body, fmt, _eof| parse_body(body, fmt, cfg),
+        |chunk| {
+            stats.merge(chunk);
+            Ok(true)
+        },
+    )?;
 
     Ok((stats, format))
 }
@@ -301,7 +392,7 @@ where
         let started = Instant::now();
         let mut last_report = started;
         let mut bytes_read = 0u64;
-        let mut stopped = false;
+        let mut stage_error = None;
 
         while let Ok(block) = full_rx.recv() {
             if block.format.is_some() {
@@ -310,10 +401,17 @@ where
 
             if block.len > 0 {
                 let fmt = format.expect("a non-empty block has a detected format");
-                if !on_block(&block.buf[..block.len], fmt, block.eof)? {
-                    stopped = true;
-                    bytes_read += block.len as u64;
-                    break;
+                match on_block(&block.buf[..block.len], fmt, block.eof) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        bytes_read += block.len as u64;
+                        break;
+                    }
+                    Err(e) => {
+                        stage_error = Some(e);
+                        bytes_read += block.len as u64;
+                        break;
+                    }
                 }
             }
 
@@ -330,12 +428,203 @@ where
             }
         }
 
-        if stopped {
-            // Unblock the reader: it may be waiting to hand us a block (the
-            // full channel is dropped) or to get a free buffer back.
-            drop(full_rx);
-            drop(free_tx);
+        // Unblock the reader before joining it.  It may be waiting to hand us
+        // a block (the full channel is dropped) or to get a free buffer back.
+        drop(full_rx);
+        drop(free_tx);
+
+        match reader.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(anyhow::anyhow!("reader thread panicked")),
         }
+
+        if let Some(e) = stage_error {
+            return Err(e);
+        }
+
+        if cfg.verbose {
+            report_progress(label, bytes_read, started.elapsed());
+        }
+
+        Ok(format)
+    })
+}
+
+/// Two-stage block pipeline used by the CPU-heavy commands.
+///
+/// Stage 1 runs on the dedicated reader thread: it decompresses input (the
+/// gzip decoder uses several workers internally) and cuts record-aligned
+/// blocks.  Stage 2 runs `process` on up to `workers` blocks concurrently on
+/// the rayon pool.  At most `workers + 1` block buffers are alive, so memory
+/// stays bounded independently of the input size.  Results are consumed in
+/// input order.
+fn stream_blocks_map<F, P, C, T>(
+    cfg: &StreamConfig,
+    label: &str,
+    mut fill: F,
+    workers: usize,
+    process: P,
+    mut consume: C,
+) -> Result<Option<Format>>
+where
+    F: FnMut(&mut [u8]) -> Result<usize> + Send,
+    P: Fn(&[u8], Format, bool) -> Result<T> + Sync,
+    C: FnMut(T) -> Result<bool> + Send,
+    T: Send,
+{
+    // A single-thread rayon pool cannot run a block task while this thread
+    // blocks waiting for its result, so use the sequential pipeline instead.
+    // This also keeps `-t 1` working when the caller is already a rayon worker.
+    if rayon::current_num_threads() <= 1 {
+        let process = &process;
+        let mut consume = consume;
+        return stream_blocks_with(cfg, label, fill, |body, fmt, eof| {
+            let value = process(body, fmt, eof)?;
+            consume(value)
+        });
+    }
+
+    let block_size = cfg.block_size.max(1);
+    let max_block_size = cfg.max_block_size.max(block_size);
+    let workers = workers.max(1);
+    let depth = workers.saturating_add(1);
+
+    let (full_tx, full_rx) = sync_channel::<Block>(depth);
+    let (free_tx, free_rx) = sync_channel::<Vec<u8>>(depth);
+    // `rayon::scope` requires its closure to be `Send`; a mutex makes the
+    // (single-consumer) block receiver shareable for that bound.
+    let full_rx = std::sync::Mutex::new(full_rx);
+
+    for _ in 0..depth {
+        let _ = free_tx.send(vec![0u8; block_size]);
+    }
+
+    thread::scope(|scope| -> Result<Option<Format>> {
+        let reader = scope
+            .spawn(move || reader_loop(&mut fill, block_size, max_block_size, full_tx, free_rx));
+
+        let mut format = None;
+        let started = Instant::now();
+        let mut last_report = started;
+        let mut bytes_read = 0u64;
+        let mut stopped = false;
+        let mut stage_error = None;
+
+        let process = &process;
+        let stage_result = rayon::scope(|s| -> Result<Option<Format>> {
+            // Task results arrive out of order; `ready` reorders them before
+            // `consume` is called.  `workers` bounds both concurrency and the
+            // number of result buffers that can be outstanding.
+            let (result_tx, result_rx) = sync_channel::<(u64, Result<T>)>(workers);
+            let mut ready: BTreeMap<u64, Result<T>> = BTreeMap::new();
+            let mut submitted = 0u64;
+            let mut consumed = 0u64;
+
+            while let Ok(block) = full_rx.lock().expect("block receiver poisoned").recv() {
+                if block.format.is_some() {
+                    format = block.format;
+                }
+
+                let eof = block.eof;
+                if block.len > 0 {
+                    let fmt = format.expect("a non-empty block has a detected format");
+                    let index = submitted;
+                    submitted += 1;
+
+                    let task_result_tx = result_tx.clone();
+                    let task_free_tx = free_tx.clone();
+                    s.spawn(move |_| {
+                        // A panic would otherwise leave `result_rx` waiting
+                        // forever for this block.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            process(&block.buf[..block.len], fmt, eof)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("processing task panicked")));
+                        let _ = task_result_tx.send((index, result));
+                        // Never block here: on early cancellation the receiver
+                        // may already be gone.
+                        let _ = task_free_tx.try_send(block.buf);
+                    });
+                } else {
+                    let _ = free_tx.try_send(block.buf);
+                }
+
+                bytes_read += block.len as u64;
+                if cfg.verbose && !eof && last_report.elapsed() >= Duration::from_secs(5) {
+                    report_progress(label, bytes_read, started.elapsed());
+                    last_report = Instant::now();
+                }
+
+                if eof {
+                    break;
+                }
+
+                while submitted - consumed >= workers as u64 {
+                    let (index, result) = result_rx.recv().expect("a block task is outstanding");
+                    ready.insert(index, result);
+
+                    while let Some(result) = ready.remove(&consumed) {
+                        match result {
+                            Ok(value) => {
+                                if !consume(value)? {
+                                    stopped = true;
+                                }
+                            }
+                            Err(e) => {
+                                stage_error = Some(e);
+                                stopped = true;
+                            }
+                        }
+                        consumed += 1;
+                        if stopped {
+                            break;
+                        }
+                    }
+                    if stopped {
+                        break;
+                    }
+                }
+                if stopped {
+                    break;
+                }
+            }
+
+            // Drain the remaining results in input order.  Even after an early
+            // stop every task is received so no sender is left blocked.
+            while consumed < submitted {
+                let (index, result) = result_rx.recv().expect("a block task is outstanding");
+                ready.insert(index, result);
+
+                while let Some(result) = ready.remove(&consumed) {
+                    if !stopped {
+                        match result {
+                            Ok(value) => {
+                                if !consume(value)? {
+                                    stopped = true;
+                                }
+                            }
+                            Err(e) => {
+                                stage_error = Some(e);
+                                stopped = true;
+                            }
+                        }
+                    }
+                    consumed += 1;
+                }
+            }
+
+            if let Some(e) = stage_error {
+                return Err(e);
+            }
+
+            Ok(format)
+        });
+
+        // Unblock the reader: it may be waiting for a free buffer or trying to
+        // hand us a block after an early stop or an error.
+        drop(full_rx);
+        drop(free_tx);
 
         match reader.join() {
             Ok(Ok(())) => {}
@@ -347,7 +636,7 @@ where
             report_progress(label, bytes_read, started.elapsed());
         }
 
-        Ok(format)
+        stage_result
     })
 }
 
@@ -553,10 +842,7 @@ pub(crate) fn plan_chunks(data: &[u8], format: Format) -> Vec<(usize, usize)> {
             .par_iter()
             .map(|&(start, _)| align_fasta_start(data, start))
             .collect(),
-        Format::Fastq => ranges
-            .par_iter()
-            .map(|&(start, _)| align_fastq_start(data, start))
-            .collect(),
+        Format::Fastq => wrapped_fastq_boundaries(data, &ranges),
     };
 
     boundaries.push(data.len());
@@ -584,34 +870,30 @@ fn align_fasta_start(data: &[u8], start: usize) -> usize {
     }
 }
 
-/// Find the next complete FASTQ record start at or after `start`.
+/// Chunk boundaries for FASTQ.
 ///
-/// The block starts on a record boundary, so scanning forward from each chunk
-/// boundary needs to inspect at most one record; no global line counting is
-/// required.
-#[inline]
-fn align_fastq_start(data: &[u8], start: usize) -> usize {
-    let mut pos = start;
+/// The block starts on a record boundary, so scanning forward from the previous
+/// boundary needs to inspect at most one record.  Wrapped sequence and quality
+/// lines are handled by walking records exactly from the block start, because a
+/// quality line may itself begin with `@` and cannot be validated locally.
+fn wrapped_fastq_boundaries(data: &[u8], ranges: &[(usize, usize)]) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(ranges.len());
+    let mut pos = 0usize;
 
-    // Move to the next line start if `pos` is in the middle of a line.
-    if pos > 0 && data[pos - 1] != b'\n' {
-        match memchr(b'\n', &data[pos..]) {
-            Some(i) => pos += i + 1,
-            None => return data.len(),
+    for &(target, _) in ranges {
+        while pos < target {
+            match fastq_record_end_at(data, pos) {
+                Some(end) if end > pos => pos = end,
+                _ => {
+                    pos = data.len();
+                    break;
+                }
+            }
         }
+        boundaries.push(pos);
     }
 
-    while pos < data.len() {
-        if data[pos] == b'@' && is_fastq_record_start(data, pos) {
-            return pos;
-        }
-        match memchr(b'\n', &data[pos..]) {
-            Some(i) => pos += i + 1,
-            None => return data.len(),
-        }
-    }
-
-    data.len()
+    boundaries
 }
 
 /// Byte offset of the last complete FASTA record in the block.
@@ -624,59 +906,98 @@ fn fasta_complete_prefix(data: &[u8]) -> usize {
 
 /// Byte offset of the last complete FASTQ record in the block.
 ///
-/// Instead of counting every line, scan backwards for a candidate `@` line and
-/// validate the four-line record structure.  Normally this only examines the
-/// final record (or the previous one when the block ends mid-record).
+/// Walk records from the block start, which is always record-aligned.  The
+/// common four-line layout takes a fast path; wrapped sequence and quality
+/// lines fall back to the general parser.  Scanning backwards for a candidate
+/// `@` header is not safe: a quality line may itself begin with `@`.
 fn fastq_complete_prefix(data: &[u8]) -> usize {
-    let mut end = data.len();
+    let mut pos = 0usize;
 
-    while let Some(pos) = memmem::rfind(&data[..end], b"\n@") {
-        let start = pos + 1;
-        if is_fastq_record_start(data, start) {
-            return start;
+    while let Some(end) = fastq_record_end_at(data, pos) {
+        if end <= pos {
+            break;
         }
-        end = pos;
+        pos = end;
     }
 
-    0
+    pos
 }
 
-/// Check whether a four-line FASTQ record starting at `start` is complete.
-fn is_fastq_record_start(data: &[u8], start: usize) -> bool {
+/// Parse one FASTQ record, preferring the cheaper fixed-line check.
+#[inline]
+pub(crate) fn fastq_record_end_at(data: &[u8], start: usize) -> Option<usize> {
+    fastq_record_end_four_line(data, start).or_else(|| fastq_record_end(data, start))
+}
+
+/// Validate a four-line FASTQ record at `start` and return its end offset.
+fn fastq_record_end_four_line(data: &[u8], start: usize) -> Option<usize> {
     if data.get(start) != Some(&b'@') {
-        return false;
+        return None;
     }
 
-    // Definition line.
-    let Some(i) = memchr(b'\n', &data[start..]) else {
-        return false;
-    };
-    let seq_start = start + i + 1;
-
-    // Sequence line.
-    let Some(i) = memchr(b'\n', &data[seq_start..]) else {
-        return false;
-    };
-    let plus_start = seq_start + i + 1;
+    let header_end = memchr(b'\n', &data[start..])? + start;
+    let seq_start = header_end + 1;
+    let seq_end = memchr(b'\n', &data[seq_start..])? + seq_start;
+    let plus_start = seq_end + 1;
     if data.get(plus_start) != Some(&b'+') {
-        return false;
+        return None;
     }
-    let seq_len = plus_start - 1 - seq_start;
+    let plus_end = memchr(b'\n', &data[plus_start..])? + plus_start;
+    let qual_start = plus_end + 1;
+    let qual_end = memchr(b'\n', &data[qual_start..])? + qual_start;
+
+    let seq_len = strip_cr(&data[seq_start..seq_end]).len();
+    let qual_len = strip_cr(&data[qual_start..qual_end]).len();
+
+    (seq_len == qual_len).then_some(qual_end + 1)
+}
+
+/// Return the byte offset just past a complete FASTQ record starting at
+/// `start`, or `None` when the record is incomplete or malformed.
+///
+/// A record consists of an `@` header line, one or more sequence lines, a `+`
+/// separator line, and enough quality lines to match the sequence length (CRLF
+/// line endings are accepted).  Requiring the final newline keeps an incomplete
+/// trailing record out of a non-EOF block.
+fn fastq_record_end(data: &[u8], start: usize) -> Option<usize> {
+    if data.get(start) != Some(&b'@') {
+        return None;
+    }
+
+    // Header line.
+    let header_end = memchr(b'\n', &data[start..])? + start;
+    let mut pos = header_end + 1;
+    let mut seq_len = 0usize;
+
+    // Sequence lines, up to the '+' separator line.
+    loop {
+        let line_end = memchr(b'\n', &data[pos..])? + pos;
+        let line = strip_cr(&data[pos..line_end]);
+        if line.first() == Some(&b'+') {
+            break;
+        }
+        seq_len = seq_len.checked_add(line.len())?;
+        pos = line_end + 1;
+    }
 
     // Separator line.
-    let Some(i) = memchr(b'\n', &data[plus_start..]) else {
-        return false;
-    };
-    let qual_start = plus_start + i + 1;
+    let plus_end = memchr(b'\n', &data[pos..])? + pos;
+    pos = plus_end + 1;
 
-    // Quality line (may be unterminated at EOF).
-    let qual_end = match memchr(b'\n', &data[qual_start..]) {
-        Some(i) => qual_start + i,
-        None => data.len(),
-    };
-    let qual_len = qual_end - qual_start;
+    // Quality lines; their total length must equal the sequence length.
+    let mut qual_len = 0usize;
+    while qual_len < seq_len {
+        let line_end = memchr(b'\n', &data[pos..])? + pos;
+        qual_len = qual_len.checked_add(strip_cr(&data[pos..line_end]).len())?;
+        pos = line_end + 1;
+    }
 
-    seq_len == qual_len
+    (qual_len == seq_len).then_some(pos)
+}
+
+#[inline]
+fn strip_cr(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 fn parse_fasta(slice: &[u8], opts: &StatOptions, capture_alphabet: bool) -> Result<ChunkStats> {
@@ -711,33 +1032,133 @@ fn parse_fasta(slice: &[u8], opts: &StatOptions, capture_alphabet: bool) -> Resu
 }
 
 fn parse_fastq(slice: &[u8], opts: &StatOptions, capture_alphabet: bool) -> Result<ChunkStats> {
-    let mut reader = fastq::io::Reader::new(slice);
-    let mut record = fastq::Record::default();
     let mut stats = ChunkStats::default();
+    let mut pos = 0usize;
+    let mut seq_buf = Vec::new();
+    let mut qual_buf = Vec::new();
 
-    loop {
-        let n = reader
-            .read_record(&mut record)
-            .context("failed to read FASTQ record")?;
-        if n == 0 {
-            break;
+    while pos < slice.len() {
+        if slice[pos] != b'@' {
+            bail!("expected '@' at byte offset {pos}");
         }
 
-        if capture_alphabet && stats.alphabet.is_none() {
-            stats.alphabet = Some(guess_alphabet(record.sequence()));
+        let header_end = memchr(b'\n', &slice[pos..])
+            .map(|i| pos + i)
+            .with_context(|| format!("unterminated FASTQ header at byte offset {pos}"))?;
+        let name = strip_cr(&slice[pos + 1..header_end]);
+        let mut line_start = header_end + 1;
+
+        // Fast path: a four-line record with terminated lines.
+        if let Some(end) = fastq_record_end_four_line(slice, pos) {
+            let seq_start = line_start;
+            let seq_end = memchr(b'\n', &slice[seq_start..])
+                .map(|i| seq_start + i)
+                .expect("four-line record was validated");
+            let plus_end = memchr(b'\n', &slice[seq_end + 1..])
+                .map(|i| seq_end + 1 + i)
+                .expect("four-line record was validated");
+            let qual_start = plus_end + 1;
+            let qual_end = memchr(b'\n', &slice[qual_start..])
+                .map(|i| qual_start + i)
+                .expect("four-line record was validated");
+
+            let seq = strip_cr(&slice[seq_start..seq_end]);
+            let qual = strip_cr(&slice[qual_start..qual_end]);
+            add_fastq_stats(
+                &mut stats,
+                seq,
+                qual,
+                opts,
+                capture_alphabet,
+                name,
+            )?;
+
+            pos = end;
+            continue;
         }
 
-        stats
-            .add(record.sequence(), Some(record.quality_scores()), opts)
-            .with_context(|| {
-                format!(
-                    "failed to accumulate FASTQ record {:?}",
-                    String::from_utf8_lossy(record.name())
-                )
-            })?;
+        // Wrapped (or final unterminated) record: join sequence and quality
+        // lines until their lengths match.
+        seq_buf.clear();
+        loop {
+            if line_start >= slice.len() {
+                bail!("unterminated FASTQ sequence at byte offset {pos}");
+            }
+            let line_end = memchr(b'\n', &slice[line_start..])
+                .map(|i| line_start + i)
+                .unwrap_or(slice.len());
+            let line = strip_cr(&slice[line_start..line_end]);
+
+            if line.first() == Some(&b'+') {
+                line_start = (line_end + 1).min(slice.len());
+                break;
+            }
+
+            seq_buf.extend_from_slice(line);
+            if line_end == slice.len() {
+                bail!("unterminated FASTQ sequence at byte offset {pos}");
+            }
+            line_start = line_end + 1;
+        }
+
+        qual_buf.clear();
+        while qual_buf.len() < seq_buf.len() {
+            if line_start >= slice.len() {
+                break;
+            }
+            let line_end = memchr(b'\n', &slice[line_start..])
+                .map(|i| line_start + i)
+                .unwrap_or(slice.len());
+            qual_buf.extend_from_slice(strip_cr(&slice[line_start..line_end]));
+
+            if line_end == slice.len() {
+                line_start = slice.len();
+                break;
+            }
+            line_start = line_end + 1;
+        }
+
+        if qual_buf.len() != seq_buf.len() {
+            bail!(
+                "FASTQ record at byte offset {pos} has sequence length {} but quality length {}",
+                seq_buf.len(),
+                qual_buf.len()
+            );
+        }
+
+        add_fastq_stats(
+            &mut stats,
+            &seq_buf,
+            &qual_buf,
+            opts,
+            capture_alphabet,
+            name,
+        )?;
+
+        pos = line_start;
     }
 
     Ok(stats)
+}
+
+fn add_fastq_stats(
+    stats: &mut ChunkStats,
+    seq: &[u8],
+    qual: &[u8],
+    opts: &StatOptions,
+    capture_alphabet: bool,
+    name: &[u8],
+) -> Result<()> {
+    if capture_alphabet && stats.alphabet.is_none() {
+        stats.alphabet = Some(guess_alphabet(seq));
+    }
+
+    stats.add(seq, Some(qual), opts).with_context(|| {
+        format!(
+            "failed to accumulate FASTQ record {:?}",
+            String::from_utf8_lossy(name)
+        )
+    })
 }
 
 /// Detect the format and return the offset of the first record marker.
@@ -815,18 +1236,18 @@ fn read_pool() -> &'static ThreadPool {
 }
 
 /// Fills blocks from a plain file.
-struct FileFiller<'a> {
-    file: &'a File,
+struct FileFiller {
+    file: File,
     offset: u64,
     len: u64,
     read_threads: usize,
     prefetch: bool,
 }
 
-impl FileFiller<'_> {
+impl FileFiller {
     fn fill(&mut self, buf: &mut [u8]) -> Result<usize> {
         let n = read_block_parallel(
-            self.file,
+            &self.file,
             &mut self.offset,
             self.len,
             buf,
@@ -1100,6 +1521,39 @@ mod tests {
         out.into_bytes()
     }
 
+    /// FASTQ with sequence and quality wrapped at 60 columns.  The first
+    /// record is short (four lines) to exercise mixed layouts.
+    pub(super) fn wrapped_fastq_body(records: usize) -> Vec<u8> {
+        let mut out = String::new();
+        out.reserve(records * 250);
+        for i in 0..records {
+            let len = if i == 0 { 40 } else { 100 + (i % 3) * 30 };
+            let seq: String = (0..len)
+                .map(|j| match (i + j) % 5 {
+                    0 => 'N',
+                    1 => 'G',
+                    2 => 'C',
+                    _ => 'A',
+                })
+                .collect();
+            let qual: String = (0..len)
+                .map(|j| (b'!' + ((i + j) % 41) as u8) as char)
+                .collect();
+
+            out.push_str(&format!("@read{i}\n"));
+            for line in seq.as_bytes().chunks(60) {
+                out.push_str(std::str::from_utf8(line).unwrap());
+                out.push('\n');
+            }
+            out.push_str("+\n");
+            for line in qual.as_bytes().chunks(60) {
+                out.push_str(std::str::from_utf8(line).unwrap());
+                out.push('\n');
+            }
+        }
+        out.into_bytes()
+    }
+
     pub(super) fn assert_same(whole: &ChunkStats, chunked: &ChunkStats) {
         assert_eq!(whole.count, chunked.count);
         assert_eq!(whole.sum_len, chunked.sum_len);
@@ -1142,6 +1596,34 @@ mod tests {
     #[test]
     fn fastq_chunking_with_crlf() {
         let lf = String::from_utf8(fastq_body(10_000)).unwrap();
+        let crlf = lf.replace('\n', "\r\n").into_bytes();
+
+        let opts = config(true);
+        let whole = parse_fastq(&crlf, &opts.stats, true).unwrap();
+        let chunked = parse_body(&crlf, Format::Fastq, &opts).unwrap();
+        assert_same(&whole, &chunked);
+    }
+
+    #[test]
+    fn wrapped_fastq_chunking_matches_single_chunk() {
+        let body = wrapped_fastq_body(20_000);
+        let opts = config(true);
+        let whole = parse_fastq(&body, &opts.stats, true).unwrap();
+        let chunked = parse_body(&body, Format::Fastq, &opts).unwrap();
+
+        let chunks = plan_chunks(&body, Format::Fastq);
+        assert!(chunks.len() > 1);
+        for &(start, end) in &chunks {
+            assert_eq!(body[start], b'@');
+            assert!(start == 0 || body[start - 1] == b'\n');
+            assert!(end > start);
+        }
+        assert_same(&whole, &chunked);
+    }
+
+    #[test]
+    fn wrapped_fastq_chunking_with_crlf() {
+        let lf = String::from_utf8(wrapped_fastq_body(10_000)).unwrap();
         let crlf = lf.replace('\n', "\r\n").into_bytes();
 
         let opts = config(true);
@@ -1233,6 +1715,17 @@ mod stream_tests {
         let crlf = lf.replace('\n', "\r\n").into_bytes();
         let whole = parse_body(&crlf, Format::Fastq, &config(32 << 20)).unwrap();
         let (streamed, _) = stream_stats(Cursor::new(&crlf), &config(333), "test").unwrap();
+        assert_same(&whole, &streamed);
+    }
+
+    #[test]
+    fn streaming_wrapped_fastq_matches_bulk() {
+        use super::tests::wrapped_fastq_body;
+
+        let body = wrapped_fastq_body(5_000);
+        let whole = parse_body(&body, Format::Fastq, &config(32 << 20)).unwrap();
+        let (streamed, format) = stream_stats(Cursor::new(&body), &config(777), "test").unwrap();
+        assert_eq!(format, Some(Format::Fastq));
         assert_same(&whole, &streamed);
     }
 

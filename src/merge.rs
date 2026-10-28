@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use crate::parser::{Format, StreamConfig, stream_path};
 use crate::util::is_broken_pipe;
 
-pub fn run(files: &[String], cfg: &StreamConfig, out: &mut dyn Write) -> Result<bool> {
+pub fn run(files: &[String], cfg: &StreamConfig, out: &mut (dyn Write + Send)) -> Result<bool> {
     let mut expected: Option<Format> = None;
     let mut failed = false;
 
@@ -50,7 +50,7 @@ impl std::error::Error for FormatMismatch {}
 fn merge_path(
     path: &str,
     cfg: &StreamConfig,
-    out: &mut dyn Write,
+    out: &mut (dyn Write + Send),
     expected: &mut Option<Format>,
 ) -> Result<()> {
     let mut file_format: Option<Format> = None;

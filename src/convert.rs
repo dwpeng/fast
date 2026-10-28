@@ -11,55 +11,67 @@ use anyhow::{Context, Result, bail};
 use memchr::{memchr, memmem};
 use rayon::prelude::*;
 
-use crate::parser::{Format, StreamConfig, plan_chunks, stream_path};
+use crate::parser::{Format, StreamConfig, plan_chunks, stream_path_map};
 
 /// Convert FASTA to FASTQ, using `qual` (a Phred+33 quality byte) for every
 /// generated quality score.
-pub fn fa2fq(path: &str, qual: u8, cfg: &StreamConfig, out: &mut dyn Write) -> Result<()> {
-    stream_path(path, cfg, |body, format, _eof| {
-        if format != Format::Fasta {
-            bail!("expected FASTA input, found {}", format.label());
-        }
+///
+/// Decompression/framing and block conversion are two pipeline stages: whole
+/// blocks are converted on several threads, then their buffers are written in
+/// input order.
+pub fn fa2fq(path: &str, qual: u8, cfg: &StreamConfig, out: &mut (dyn Write + Send)) -> Result<()> {
+    stream_path_map(
+        path,
+        cfg,
+        |body, format, _eof| -> Result<Vec<Vec<u8>>> {
+            if format != Format::Fasta {
+                bail!("expected FASTA input, found {}", format.label());
+            }
 
-        let chunks: Vec<Result<Vec<u8>>> = plan_chunks(body, Format::Fasta)
-            .par_iter()
-            .map(|&(start, end)| {
-                convert_fasta_chunk(&body[start..end], qual)
-                    .with_context(|| format!("records in byte range {start}..{end}"))
-            })
-            .collect();
-
-        for chunk in chunks {
-            out.write_all(&chunk?)?;
-        }
-
-        Ok(true)
-    })?;
+            plan_chunks(body, Format::Fasta)
+                .par_iter()
+                .map(|&(start, end)| {
+                    convert_fasta_chunk(&body[start..end], qual)
+                        .with_context(|| format!("records in byte range {start}..{end}"))
+                })
+                .collect()
+        },
+        |chunks| {
+            for chunk in chunks {
+                out.write_all(&chunk)?;
+            }
+            Ok(true)
+        },
+    )?;
 
     Ok(())
 }
 
 /// Convert FASTQ to FASTA, dropping quality scores.
-pub fn fq2fa(path: &str, cfg: &StreamConfig, out: &mut dyn Write) -> Result<()> {
-    stream_path(path, cfg, |body, format, _eof| {
-        if format != Format::Fastq {
-            bail!("expected FASTQ input, found {}", format.label());
-        }
+pub fn fq2fa(path: &str, cfg: &StreamConfig, out: &mut (dyn Write + Send)) -> Result<()> {
+    stream_path_map(
+        path,
+        cfg,
+        |body, format, _eof| -> Result<Vec<Vec<u8>>> {
+            if format != Format::Fastq {
+                bail!("expected FASTQ input, found {}", format.label());
+            }
 
-        let chunks: Vec<Result<Vec<u8>>> = plan_chunks(body, Format::Fastq)
-            .par_iter()
-            .map(|&(start, end)| {
-                convert_fastq_chunk(&body[start..end])
-                    .with_context(|| format!("records in byte range {start}..{end}"))
-            })
-            .collect();
-
-        for chunk in chunks {
-            out.write_all(&chunk?)?;
-        }
-
-        Ok(true)
-    })?;
+            plan_chunks(body, Format::Fastq)
+                .par_iter()
+                .map(|&(start, end)| {
+                    convert_fastq_chunk(&body[start..end])
+                        .with_context(|| format!("records in byte range {start}..{end}"))
+                })
+                .collect()
+        },
+        |chunks| {
+            for chunk in chunks {
+                out.write_all(&chunk)?;
+            }
+            Ok(true)
+        },
+    )?;
 
     Ok(())
 }
@@ -135,7 +147,8 @@ fn copy_fasta_sequence(mut data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Convert one record-aligned four-line FASTQ range.
+/// Convert one record-aligned FASTQ range.  Wrapped sequence and quality lines
+/// are joined into single lines in the FASTA output.
 fn convert_fastq_chunk(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 2 + 64);
     let mut pos = 0;
@@ -151,45 +164,53 @@ fn convert_fastq_chunk(data: &[u8]) -> Result<Vec<u8>> {
             .with_context(|| format!("unterminated FASTQ header at offset {pos}"))?;
         let header = strip_cr(&data[header_start..header_end]);
 
-        let seq_start = header_end + 1;
-        let seq_end = memchr(b'\n', &data[seq_start..])
-            .map(|i| seq_start + i)
-            .with_context(|| format!("unterminated FASTQ sequence at offset {pos}"))?;
-        let seq = strip_cr(&data[seq_start..seq_end]);
+        // Sequence lines, up to the '+' separator line.
+        let mut line_start = header_end + 1;
+        let mut seq = Vec::new();
+        let plus_line_end = loop {
+            let line_end = memchr(b'\n', &data[line_start..])
+                .map(|i| line_start + i)
+                .with_context(|| format!("unterminated FASTQ sequence at offset {pos}"))?;
+            let line = strip_cr(&data[line_start..line_end]);
+            if line.first() == Some(&b'+') {
+                break line_end;
+            }
+            seq.extend_from_slice(line);
+            line_start = line_end + 1;
+        };
 
-        let plus_start = seq_end + 1;
-        if data.get(plus_start) != Some(&b'+') {
-            bail!("expected '+' at offset {plus_start}");
+        // Quality lines.  The final line may be unterminated at EOF.
+        let mut qual_start = plus_line_end + 1;
+        let mut qual_len = 0usize;
+        while qual_len < seq.len() {
+            if qual_start >= data.len() {
+                break;
+            }
+            let line_end = memchr(b'\n', &data[qual_start..])
+                .map(|i| qual_start + i)
+                .unwrap_or(data.len());
+            qual_len += strip_cr(&data[qual_start..line_end]).len();
+            if line_end == data.len() {
+                qual_start = data.len();
+                break;
+            }
+            qual_start = line_end + 1;
         }
-        let plus_end = memchr(b'\n', &data[plus_start..])
-            .map(|i| plus_start + i)
-            .with_context(|| format!("unterminated FASTQ separator at offset {pos}"))?;
 
-        let qual_start = plus_end + 1;
-        let qual_end = memchr(b'\n', &data[qual_start..])
-            .map(|i| qual_start + i)
-            .unwrap_or(data.len());
-        let qual = strip_cr(&data[qual_start..qual_end]);
-
-        if seq.len() != qual.len() {
+        if seq.len() != qual_len {
             bail!(
-                "FASTQ record at offset {pos} has sequence length {} but quality length {}",
-                seq.len(),
-                qual.len()
+                "FASTQ record at offset {pos} has sequence length {} but quality length {qual_len}",
+                seq.len()
             );
         }
 
         out.push(b'>');
         out.extend_from_slice(header);
         out.push(b'\n');
-        out.extend_from_slice(seq);
+        out.extend_from_slice(&seq);
         out.push(b'\n');
 
-        pos = if qual_end < data.len() {
-            qual_end + 1
-        } else {
-            data.len()
-        };
+        pos = qual_start;
     }
 
     Ok(out)

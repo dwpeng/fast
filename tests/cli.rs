@@ -199,6 +199,66 @@ fn fa2fq_handles_an_empty_sequence_before_another_record() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Three wrapped FASTQ records: 100 bp sequence/quality split over two lines.
+fn wrapped_fastq() -> String {
+    let mut out = String::new();
+    for i in 0..3 {
+        let seq = "A".repeat(100);
+        let qual = "I".repeat(100);
+        out.push_str(&format!("@r{i} desc\n"));
+        for line in seq.as_bytes().chunks(60) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out.push_str("+\n");
+        for line in qual.as_bytes().chunks(60) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[test]
+fn wrapped_fastq_is_supported_end_to_end() {
+    let dir = tempdir("wrapped-fastq");
+    let body = wrapped_fastq();
+    fs::write(dir.join("a.fq"), &body).unwrap();
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["stats", "-T", "a.fq"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let text = String::from_utf8(out.stdout).unwrap();
+    let fields: Vec<&str> = text.lines().nth(1).unwrap().split('\t').map(str::trim).collect();
+    assert_eq!(fields[1..5].join(" "), "FASTQ DNA 3 300");
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["fq2fa", "a.fq"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let expected_seq = "A".repeat(100);
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!(">r0 desc\n{expected_seq}\n>r1 desc\n{expected_seq}\n>r2 desc\n{expected_seq}\n")
+    );
+
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["head", "-n", "2", "a.fq"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), &body[..body.find("@r2").unwrap()]);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn head_takes_the_first_n_records() {
     let dir = tempdir("head");

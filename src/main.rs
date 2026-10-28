@@ -12,7 +12,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 use unicode_width::UnicodeWidthStr;
 
 use crate::parser::{Config, StreamConfig, process_path};
@@ -237,22 +236,35 @@ fn run_stats(args: StatsArgs, stream: &StreamConfig) -> ExitCode {
     };
 
     // Bound the number of files processed at once so that file-level
-    // parallelism cannot blow up memory (each file keeps up to two blocks).
+    // parallelism cannot blow up memory.  Each input keeps at most three
+    // full-size pipeline buffers for plain input; gzip inputs use smaller 4 MiB
+    // blocks and therefore stay below this estimate.
     let budget = 256usize << 20;
-    let per_file = stream.block_size.saturating_mul(2).max(1);
+    let per_file = stream.block_size.saturating_mul(3).max(1);
     let max_concurrent = (budget / per_file)
         .clamp(1, 32)
         .min(rayon::current_num_threads().max(1));
 
     let mut results: Vec<(String, anyhow::Result<Summary>)> = Vec::with_capacity(files.len());
     for batch in files.chunks(max_concurrent) {
-        let batch_results: Vec<(String, anyhow::Result<Summary>)> = batch
-            .par_iter()
-            .map(|path| {
-                let name = display_name(path, args.basename);
-                (name, process_path(path, &cfg))
-            })
-            .collect();
+        let cfg = &cfg;
+        // Use OS threads for file-level parallelism: each file already uses the
+        // rayon pool for block/chunk processing, and blocking a rayon worker on
+        // a file's pipeline could starve the very tasks it waits for.
+        let batch_results: Vec<(String, anyhow::Result<Summary>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|path| {
+                    let name = display_name(path, args.basename);
+                    scope.spawn(move || (name, process_path(path, cfg)))
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("stats worker panicked"))
+                .collect()
+        });
         results.extend(batch_results);
     }
 
@@ -397,7 +409,7 @@ fn input_files(files: &[String]) -> Vec<String> {
     }
 }
 
-fn open_output(path: Option<&str>) -> anyhow::Result<Box<dyn Write>> {
+fn open_output(path: Option<&str>) -> anyhow::Result<Box<dyn Write + Send>> {
     match path {
         Some(path) if path != "-" => {
             let file =
@@ -408,7 +420,7 @@ fn open_output(path: Option<&str>) -> anyhow::Result<Box<dyn Write>> {
     }
 }
 
-fn finish_output(mut out: Box<dyn Write>, failed: bool) -> ExitCode {
+fn finish_output(mut out: Box<dyn Write + Send>, failed: bool) -> ExitCode {
     match out.flush() {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return ExitCode::SUCCESS,

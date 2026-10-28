@@ -7,7 +7,7 @@
 
 核心依赖：
 
-- [`noodles`](https://github.com/zaeleus/noodles) (`noodles-fasta` / `noodles-fastq`)：FASTA/FASTQ 记录解析
+- [`noodles`](https://github.com/zaeleus/noodles) (`noodles-fasta`)：FASTA 记录解析
 - [`rayon`](https://github.com/rayon-rs/rayon)：数据并行
 - [`clap`](https://github.com/clap-rs/clap)：命令行界面
 - [`rapidgzip-core`](https://github.com/COMBINE-lab/rapidgzip-rust)：多线程 gzip/BGZF 流式解压
@@ -21,9 +21,15 @@
 - 转换与截取按原始字节处理：`memchr` 定位行边界、整行批量拷贝、按记录边界分块并行，不经过通用记录对象
 - `head` 找到第 N 条记录的结束位置后直接拷贝原始字节，可提前停止读取
 - 支持 `.fa/.fasta/.fq/.fastq`、gzip/BGZF 压缩文件、stdin
-- 分块流式读取：每次只保留一个块和跨块尾记录，内存占用与文件大小基本无关（gzip 解压器和单条超长记录自身另有缓冲）
+- 支持多行（wrapped）FASTQ：序列和/或质量行按任意宽度折行时仍能正确识别记录边界，
+  四行记录走快速路径，多行记录走精确解析
+- 两阶段流水线：解压/分块阶段使用多线程 gzip 解码，处理阶段同时在多个记录对齐块上
+  并行；两个阶段重叠执行，结果按输入顺序消费
+- 分块流式读取：在途块数有上限，内存占用与文件大小基本无关（gzip 解压器和单条超长
+  记录自身另有缓冲）
 - 普通文件的块使用多线程 `pread` 填充，避免 mmap 缺页抖动
-- gzip/BGZF 使用 `rapidgzip-core` 并行解压（BGZF 块级并行；普通 gzip 使用 marker/window 算法自适应选择）
+- gzip/BGZF 使用 `rapidgzip-core` 并行解压（BGZF 块级并行；普通 gzip 使用 marker/window 算法自适应选择）；
+  gzip 块默认上限 4 MiB，让解压出的数据更早进入处理阶段并降低内存峰值
 - 自动识别 FASTA/FASTQ；`stats` 还会识别 DNA/RNA/Protein/Unlimit 类型
 - `stats` 多文件并行处理，输出顺序与输入一致；其他子命令按文件顺序流式写出
 - `stats` 默认表格对齐输出（带千位分隔符）；`-T` 输出对齐的制表符表格
@@ -241,8 +247,9 @@ Usage: fast head [OPTIONS] [FILE]...
 | `fast stats -T`（BGZF，块级并行） | **0.38 s** | ≈ 62 MB |
 
 gzip 使用 `rapidgzip-core` 流式解码：BGZF 按块直接并行；普通 gzip 会根据
-DEFLATE 块结构自适应选择 marker/window 并行或顺序解码。解压出的数据按块交给
-解析器，不再把整个解压结果放进内存。
+DEFLATE 块结构自适应选择 marker/window 并行或顺序解码。解压出的数据按记录边界
+切块，由独立线程继续解压下一块，同时 rayon 在多个已解压块上并行处理；块缓冲数量
+受内存预算限制，结果按输入顺序消费，不会把整个解压结果放进内存。
 
 ### 新子命令（page cache 热数据，输出到 `/dev/null`）
 
@@ -261,8 +268,9 @@ DEFLATE 块结构自适应选择 marker/window 并行或顺序解码。解压出
 
 `head` 对较小的 `-n` 会自动缩小块大小，避免为了前几条记录读取整个 16 MiB 块；
 如果单条记录大于当前块，读取块会自适应增大（上限为 `-B`），避免成千上万次小读。
-记录边界扫描在大块上使用 rayon 并行。`fa2fq`/`fq2fa` 按记录边界切块并行转换，
-最后顺序写出以保持输入顺序。
+`head` 的 FASTQ 记录边界按实际行结构精确扫描，支持多行序列/质量。`fa2fq`/`fq2fa`
+按记录边界切块并行转换，最后顺序写出以保持输入顺序；`fq2fa` 也会把多行 FASTQ
+序列拼接成单行 FASTA。
 
 ### 超大文件（冷缓存）
 
